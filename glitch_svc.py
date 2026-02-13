@@ -18,7 +18,10 @@ GLITCH_LEVELS = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.65, 0.80]  # 
 GLITCH_TYPES = {
     "random": "Random byte corruption",
     "zero": "Byte zeroing (blocky artifacts)",
-    "block": "Block corruption (large artifacts)"
+    "block": "Block corruption (large artifacts)",
+    "constant": "Constant damage throughout NAL",
+    "interval": "Damage at regular intervals",
+    "keyframe": "Obliterate keyframes (I-frames)"
 }
 
 os.makedirs(TEMP_DIR, exist_ok=True)
@@ -82,6 +85,31 @@ def corrupt_nal(data, nal_data_start, nal_end, glitch_type):
         for offset in range(block_size):
             if start_pos + offset < nal_end:
                 data[start_pos + offset] = random.randint(0, 255)
+    
+    elif glitch_type == "constant":
+        # Constant damage throughout the NAL unit
+        nal_length = nal_end - nal_data_start - 10
+        num_corruptions = max(5, nal_length // 20)  # Corrupt ~5% of bytes
+        for _ in range(num_corruptions):
+            corrupt_pos = random.randint(nal_data_start + 10, nal_end - 1)
+            data[corrupt_pos] = random.randint(0, 255)
+    
+    elif glitch_type == "interval":
+        # Damage at regular intervals throughout NAL
+        interval = random.randint(15, 40)  # Corrupt every N bytes
+        start_pos = nal_data_start + 10
+        pos = start_pos
+        while pos < nal_end - 1:
+            data[pos] = random.randint(0, 255)
+            pos += interval
+    
+    elif glitch_type == "keyframe":
+        # Obliterate keyframe data - heavy corruption
+        nal_length = nal_end - nal_data_start - 10
+        num_corruptions = max(20, nal_length // 5)  # Corrupt ~20% of bytes
+        for _ in range(num_corruptions):
+            corrupt_pos = random.randint(nal_data_start + 10, nal_end - 1)
+            data[corrupt_pos] = random.randint(0, 255)
 
 # Generate multiple videos with varying corruption levels
 for glitch_type, glitch_desc in GLITCH_TYPES.items():
@@ -106,8 +134,15 @@ for glitch_type, glitch_desc in GLITCH_TYPES.items():
             if nal_byte_pos < len(data):
                 nal_type = data[nal_byte_pos] & 0x1F
                 
-                # Only corrupt slice NAL units (type 1, 5), skip SPS(7), PPS(8), SEI(6)
-                if nal_type in [1, 5] and random.random() < glitch_prob:
+                # Determine which NAL types to target based on glitch type
+                if glitch_type == "keyframe":
+                    # Target only keyframes (IDR frames, type 5)
+                    should_corrupt = nal_type == 5 and random.random() < glitch_prob
+                else:
+                    # Target regular slices (type 1) and keyframes (type 5), skip SPS(7), PPS(8), SEI(6)
+                    should_corrupt = nal_type in [1, 5] and random.random() < glitch_prob
+                
+                if should_corrupt:
                     nal_end = indices[i+1][0] if i+1 < len(indices) else len(data)
                     nal_data_start = nal_byte_pos + 1
                     

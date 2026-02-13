@@ -6,13 +6,16 @@ Creates glitched video art by intentionally corrupting H.264 video streams.
 
 1. Encodes video into base and enhancement layers
 2. Corrupts the enhancement layer NAL units to create glitch effects
-3. Generates 30 videos with 3 damage types at 10 corruption levels each
+3. Generates 60 videos with 6 damage types at 10 corruption levels each
 
 ## Glitch Types
 
 - **Random**: Random byte corruption (chaotic artifacts)
 - **Zero**: Byte zeroing (blocky/black artifacts)
 - **Block**: Block corruption (large consecutive damage)
+- **Constant**: Constant damage throughout NAL units (persistent artifacts)
+- **Interval**: Damage at regular intervals (rhythmic glitches)
+- **Keyframe**: Obliterate keyframes/I-frames (severe reference corruption)
 
 ## Requirements
 
@@ -36,6 +39,9 @@ Output videos are saved to `glitched_outputs/` with filenames like:
 - `glitched_random_01_05pct.mp4` (5% corruption)
 - `glitched_zero_05_25pct.mp4` (25% corruption)
 - `glitched_block_10_80pct.mp4` (80% corruption)
+- `glitched_constant_07_40pct.mp4` (40% corruption)
+- `glitched_interval_03_15pct.mp4` (15% corruption)
+- `glitched_keyframe_09_65pct.mp4` (65% corruption)
 
 ## Notes
 
