@@ -1,0 +1,40 @@
+# Temporary encoding files
+tmp_svc/
+
+# Generated output videos
+glitched_outputs/
+
+# Input video file
+input.mp4
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Raw video streams
+*.264
+*.265
+*.h264
+*.h265
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
