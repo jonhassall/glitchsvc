@@ -11,8 +11,8 @@ BASE_LAYER_FILE = os.path.join(TEMP_DIR, "base_layer.264")
 ENH_LAYER_FILE = os.path.join(TEMP_DIR, "enh_layer.264")
 GLITCHED_FILE = os.path.join(TEMP_DIR, "glitched.264")
 
-NUM_OUTPUTS = 10  # Number of videos per glitch type
-GLITCH_LEVELS = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.65, 0.80]  # Corruption probabilities
+NUM_OUTPUTS = 14  # Number of videos per glitch type
+GLITCH_LEVELS = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.65, 0.80, 0.90, 0.95, 0.98, 0.99]  # Corruption probabilities
 
 # Define 3 glitch types
 GLITCH_TYPES = {
@@ -21,11 +21,24 @@ GLITCH_TYPES = {
     "block": "Block corruption (large artifacts)",
     "constant": "Constant damage throughout NAL",
     "interval": "Damage at regular intervals",
-    "keyframe": "Obliterate keyframes (I-frames)"
+    "keyframe": "Obliterate keyframes (I-frames)",
+    "keyframe_destroy": "Completely destroy keyframes (total annihilation)"
 }
 
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+# === Get input video framerate ===
+print("Getting input video framerate...")
+result = subprocess.run([
+    "ffprobe", "-v", "error",
+    "-select_streams", "v:0",
+    "-show_entries", "stream=r_frame_rate",
+    "-of", "default=noprint_wrappers=1:nokey=1",
+    INPUT_FILE
+], capture_output=True, text=True)
+INPUT_FRAMERATE = result.stdout.strip()
+print(f"Input framerate: {INPUT_FRAMERATE} fps")
 
 # === STEP 1: Encode base layer (low-res) ===
 print("Encoding base layer (low-res)...")
@@ -110,6 +123,17 @@ def corrupt_nal(data, nal_data_start, nal_end, glitch_type):
         for _ in range(num_corruptions):
             corrupt_pos = random.randint(nal_data_start + 10, nal_end - 1)
             data[corrupt_pos] = random.randint(0, 255)
+    
+    elif glitch_type == "keyframe_destroy":
+        # Complete keyframe annihilation - corrupt most of the data
+        nal_length = nal_end - nal_data_start - 10
+        num_corruptions = max(50, int(nal_length * 0.7))  # Corrupt ~70% of bytes
+        corrupted_positions = set()
+        for _ in range(num_corruptions):
+            corrupt_pos = random.randint(nal_data_start + 10, nal_end - 1)
+            if corrupt_pos not in corrupted_positions:
+                data[corrupt_pos] = random.randint(0, 255)
+                corrupted_positions.add(corrupt_pos)
 
 # Generate multiple videos with varying corruption levels
 for glitch_type, glitch_desc in GLITCH_TYPES.items():
@@ -135,7 +159,7 @@ for glitch_type, glitch_desc in GLITCH_TYPES.items():
                 nal_type = data[nal_byte_pos] & 0x1F
                 
                 # Determine which NAL types to target based on glitch type
-                if glitch_type == "keyframe":
+                if glitch_type in ["keyframe", "keyframe_destroy"]:
                     # Target only keyframes (IDR frames, type 5)
                     should_corrupt = nal_type == 5 and random.random() < glitch_prob
                 else:
@@ -162,12 +186,15 @@ for glitch_type, glitch_desc in GLITCH_TYPES.items():
         print(f"Remuxing to {output_file}...")
         subprocess.run([
             "ffmpeg", "-y",
+            "-r", INPUT_FRAMERATE,  # Set input framerate
             "-i", GLITCHED_FILE,
             "-i", INPUT_FILE,
             "-map", "0:v:0",  # video from glitched file
             "-map", "1:a?",   # audio from original (if exists)
             "-c:v", "copy",
             "-c:a", "copy",
+            "-r", INPUT_FRAMERATE,  # Set output framerate
+            "-vsync", "cfr",  # Constant frame rate
             "-fflags", "+genpts",  # generate presentation timestamps
             output_file
         ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
