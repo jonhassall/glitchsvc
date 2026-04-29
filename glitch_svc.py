@@ -35,6 +35,24 @@ GLITCH_TYPES = {
 }
 
 
+def log_stage(stage, total_stages, message):
+    pct = int((stage / total_stages) * 100)
+    print(f"[stage {stage}/{total_stages} | {pct}%] {message}")
+
+
+def update_progress(label, current, total, last_reported=-1, step=10):
+    if total <= 0:
+        return last_reported
+    pct = int((current / total) * 100)
+    if pct >= 100 and last_reported < 100:
+        print(f"[{label}] 100% ({current}/{total})")
+        return 100
+    if pct // step > last_reported // step:
+        print(f"[{label}] {pct}% ({current}/{total})")
+        return pct
+    return last_reported
+
+
 def run_cmd(cmd, quiet=False, capture_output=False):
     kwargs = {"check": True}
     if quiet:
@@ -246,6 +264,8 @@ class YoloAnnotator:
         print("Running one-time YOLO analysis cache on input video...")
         self.cached_by_frame = []
         analyzed_frames = 0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        last_progress = -1
 
         while True:
             ok, frame = cap.read()
@@ -254,6 +274,7 @@ class YoloAnnotator:
             result = self._infer(frame)
             self.cached_by_frame.append(self._extract_frame_detections(result, width, height))
             analyzed_frames += 1
+            last_progress = update_progress("YOLO cache", analyzed_frames, total_frames, last_progress)
 
         cap.release()
         print(f"YOLO cache ready: {analyzed_frames} frame(s) analyzed once")
@@ -335,6 +356,8 @@ def annotate_video_from_cache(input_video_path, output_video_path, annotator):
         raise RuntimeError(f"Failed to open output video writer: {output_video_path}")
 
     frame_index = 0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    last_progress = -1
     while True:
         ok, frame = cap.read()
         if not ok:
@@ -342,6 +365,7 @@ def annotate_video_from_cache(input_video_path, output_video_path, annotator):
         annotated = annotator.draw_from_cache(frame, frame_index)
         writer.write(annotated)
         frame_index += 1
+        last_progress = update_progress("Annotate", frame_index, total_frames, last_progress)
 
     cap.release()
     writer.release()
@@ -385,11 +409,12 @@ def main():
     os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
-    print("Getting input video framerate...")
+    total_stages = 5
+    log_stage(1, total_stages, "Reading input metadata")
     input_framerate = get_input_framerate(input_file)
     print(f"Input framerate: {input_framerate} fps")
 
-    print("Encoding base layer (low-res)...")
+    log_stage(2, total_stages, "Encoding base layer")
     run_cmd(
         [
             "ffmpeg",
@@ -411,7 +436,7 @@ def main():
         quiet=True,
     )
 
-    print("Encoding enhancement layer (full-res)...")
+    log_stage(3, total_stages, "Encoding enhancement layer")
     run_cmd(
         [
             "ffmpeg",
@@ -434,7 +459,7 @@ def main():
     with open(ENH_LAYER_FILE, "rb") as f:
         original_data = bytearray(f.read())
 
-    print("Finding NAL units...")
+    log_stage(4, total_stages, "Finding NAL units")
     indices = find_nal_indices(original_data)
 
     annotator = YoloAnnotator(
@@ -444,21 +469,32 @@ def main():
         conf=args.yolo_conf,
     )
     if annotator.enabled:
+        log_stage(5, total_stages, "Building one-time YOLO cache")
         annotator.build_cache(input_file)
+    else:
+        log_stage(5, total_stages, "Skipping YOLO cache (disabled)")
 
-    for glitch_type, glitch_desc in GLITCH_TYPES.items():
+    total_output_count = len(GLITCH_TYPES) * NUM_OUTPUTS
+    completed_output_count = 0
+
+    for glitch_type_index, (glitch_type, glitch_desc) in enumerate(GLITCH_TYPES.items(), 1):
         print(f"\n{'=' * 60}")
-        print(f"GLITCH TYPE: {glitch_desc}")
+        print(f"GLITCH TYPE: {glitch_desc} ({glitch_type_index}/{len(GLITCH_TYPES)})")
         print(f"{'=' * 60}")
 
         for video_num, glitch_prob in enumerate(GLITCH_LEVELS, 1):
+            current_output = completed_output_count + 1
+            overall_pct = int((current_output / total_output_count) * 100)
             print(
                 f"\n=== Generating {glitch_type} video {video_num}/{NUM_OUTPUTS} "
-                f"(corruption: {glitch_prob * 100:.0f}%) ==="
+                f"(corruption: {glitch_prob * 100:.0f}%) | overall {overall_pct}% "
+                f"({current_output}/{total_output_count}) ==="
             )
 
             data = bytearray(original_data)
             corrupted_count = 0
+            last_nal_progress = -1
+            total_nals = len(indices)
 
             for i, (idx, start_code_len) in enumerate(indices):
                 nal_byte_pos = idx + start_code_len
@@ -476,6 +512,8 @@ def main():
                         if nal_data_start + 10 < nal_end:
                             corrupt_nal(data, nal_data_start, nal_end, glitch_type)
                             corrupted_count += 1
+
+                last_nal_progress = update_progress("NAL scan", i + 1, total_nals, last_nal_progress)
 
             print(f"Corrupted {corrupted_count} NAL units")
 
@@ -526,6 +564,10 @@ def main():
                 finally:
                     if os.path.exists(annotated_no_audio):
                         os.remove(annotated_no_audio)
+
+            completed_output_count += 1
+            done_pct = int((completed_output_count / total_output_count) * 100)
+            print(f"[overall] {done_pct}% complete ({completed_output_count}/{total_output_count} outputs)")
 
     print(f"\n{'=' * 60}")
     print(
