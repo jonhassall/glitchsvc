@@ -3,3 +3,5 @@ opencv-python
 ultralytics
 torch
 pillow
+openai-whisper
+deepface

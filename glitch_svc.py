@@ -3,6 +3,7 @@ import os
 import random
 import subprocess
 import uuid
+from collections import Counter
 
 import cv2
 import numpy as np
@@ -76,6 +77,10 @@ def parse_args():
     )
     parser.add_argument("--yolo-model", default="yolo11n-seg.pt", help="YOLO model path/name")
     parser.add_argument("--yolo-conf", type=float, default=0.25, help="YOLO confidence threshold")
+    parser.add_argument("--whisper", action="store_true", help="Enable Whisper word captions on generated outputs")
+    parser.add_argument("--whisper-model", default="base", help="Whisper model name (tiny/base/small/medium/large)")
+    parser.add_argument("--emotion", action="store_true", help="Enable emotion analysis overlay on detected faces")
+    parser.add_argument("--emotion-hz", type=float, default=2.0, help="Emotion analysis frequency in Hz (default: 2)")
     return parser.parse_args()
 
 
@@ -166,7 +171,7 @@ class YoloAnnotator:
         self.enabled = enabled
         self.mode = mode
         self.conf = conf
-        self.font = ImageFont.load_default()
+        self.font = self._load_font(size=16)
         self.alpha = int(255 * 0.75)
         self.border_color = (255, 70, 70, self.alpha)
         self.text_color = (255, 255, 255, self.alpha)
@@ -180,6 +185,23 @@ class YoloAnnotator:
             print(f"Loading YOLO model '{model_path}' on device '{self.device}'...")
             self.model = YOLO(model_path)
 
+    @staticmethod
+    def _load_font(size=16):
+        font_paths = [
+            "C:/Windows/Fonts/arial.ttf",
+            "C:/Windows/Fonts/calibri.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        ]
+        for path in font_paths:
+            if os.path.isfile(path):
+                try:
+                    return ImageFont.truetype(path, size)
+                except Exception:
+                    continue
+        return ImageFont.load_default()
+
     def _infer(self, frame):
         try:
             return self.model(frame, conf=self.conf, verbose=False, device=self.device)[0]
@@ -191,7 +213,7 @@ class YoloAnnotator:
                 return self.model(frame, conf=self.conf, verbose=False, device=self.device)[0]
             raise
 
-    def _get_label(self, result, idx, conf):
+    def _get_class_name(self, result, idx):
         name = "object"
         if hasattr(result, "names") and result.names is not None:
             if result.boxes is not None and result.boxes.cls is not None and idx < len(result.boxes.cls):
@@ -200,7 +222,11 @@ class YoloAnnotator:
                     name = str(result.names.get(cls_id, name))
                 elif isinstance(result.names, (list, tuple)) and 0 <= cls_id < len(result.names):
                     name = str(result.names[cls_id])
-        return f"{name} {conf:.2f}"
+        return name
+
+    def _get_label(self, result, idx, conf):
+        name = self._get_class_name(result, idx)
+        return f"{name} {int(conf * 100)}%"
 
     def _extract_frame_detections(self, result, width, height):
         frame_detections = []
@@ -224,11 +250,13 @@ class YoloAnnotator:
                 y1, y2 = y2, y1
 
             conf = float(confs[idx]) if idx < len(confs) else 1.0
-            label = self._get_label(result, idx, conf)
+            class_name = self._get_class_name(result, idx)
+            label = f"{class_name} {int(conf * 100)}%"
 
             det = {
                 "box": [x1 / width, y1 / height, x2 / width, y2 / height],
                 "label": label,
+                "class_name": class_name,
                 "mask": None,
             }
 
@@ -332,11 +360,246 @@ class YoloAnnotator:
             ty = max(0, min(h - th - 1, y2 - th - 2))
             draw.text((tx, ty), label, font=self.font, fill=self.text_color)
 
+        class_counts = Counter(det.get("class_name", "object") for det in detections)
+        if class_counts:
+            self._draw_object_hud(draw, class_counts, w, h)
+
+        composed = Image.alpha_composite(base, overlay)
+        return cv2.cvtColor(np.array(composed), cv2.COLOR_RGBA2BGR)
+
+    def _draw_object_hud(self, draw, class_counts, w, h):
+        lines = [f"{cls}: {cnt}" for cls, cnt in sorted(class_counts.items())]
+        padding = 6
+        line_height = 0
+        max_line_w = 0
+        for line in lines:
+            tb = draw.textbbox((0, 0), line, font=self.font)
+            lw = tb[2] - tb[0]
+            lh = tb[3] - tb[1]
+            max_line_w = max(max_line_w, lw)
+            line_height = max(line_height, lh)
+        total_w = max_line_w + padding * 2
+        total_h = line_height * len(lines) + padding * 2
+        draw.rectangle([(0, 0), (total_w, total_h)], fill=(0, 0, 0, 180))
+        for i, line in enumerate(lines):
+            draw.text((padding, padding + i * line_height), line, font=self.font, fill=self.text_color)
+
+
+class WhisperCaptioner:
+    def __init__(self, enabled, model_name="base"):
+        self.enabled = enabled
+        self.model_name = model_name
+        self.word_segments = []  # list of {start, end, word}
+        self.font = YoloAnnotator._load_font(size=24)
+        self.bg_color = (0, 0, 0, 160)
+        self.text_color = (255, 255, 255, 255)
+
+    def build_cache(self, input_video_path):
+        if not self.enabled:
+            return
+        import whisper
+
+        audio_path = os.path.join(TEMP_DIR, f"audio_{uuid.uuid4().hex}.wav")
+        try:
+            print("Extracting audio for Whisper transcription...")
+            run_cmd(
+                ["ffmpeg", "-y", "-i", input_video_path, "-vn", "-ar", "16000", "-ac", "1", audio_path],
+                quiet=True,
+            )
+            print(f"Loading Whisper model '{self.model_name}'...")
+            model = whisper.load_model(self.model_name)
+            print("Running Whisper transcription with word timestamps...")
+            result = model.transcribe(audio_path, word_timestamps=True)
+            self.word_segments = []
+            for segment in result.get("segments", []):
+                for word_info in segment.get("words", []):
+                    self.word_segments.append(
+                        {
+                            "start": word_info["start"],
+                            "end": word_info["end"],
+                            "word": word_info["word"].strip(),
+                        }
+                    )
+            print(f"Whisper: {len(self.word_segments)} word(s) transcribed")
+        finally:
+            if os.path.exists(audio_path):
+                os.remove(audio_path)
+
+    def _get_active_words(self, frame_index, fps):
+        if not self.word_segments:
+            return ""
+        t = frame_index / fps if fps > 0 else 0
+        active = [w["word"] for w in self.word_segments if w["start"] <= t <= w["end"]]
+        past = [w["word"] for w in self.word_segments if w["end"] < t]
+        context = past[-4:] + active
+        return " ".join(context).strip()
+
+    def draw_caption(self, frame, frame_index, fps):
+        if not self.enabled:
+            return frame
+        text = self._get_active_words(frame_index, fps)
+        if not text:
+            return frame
+
+        h, w = frame.shape[:2]
+        base = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA))
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        max_text_w = int(w * 0.9)
+        words = text.split()
+        lines = []
+        current_line = []
+        for word in words:
+            test = " ".join(current_line + [word])
+            tb = draw.textbbox((0, 0), test, font=self.font)
+            if tb[2] - tb[0] > max_text_w and current_line:
+                lines.append(" ".join(current_line))
+                current_line = [word]
+            else:
+                current_line.append(word)
+        if current_line:
+            lines.append(" ".join(current_line))
+        lines = lines[-2:]
+
+        sample_tb = draw.textbbox((0, 0), "Ag", font=self.font)
+        line_h = sample_tb[3] - sample_tb[1] + 4
+        total_h = line_h * len(lines) + 8
+        y_start = h - total_h - 20
+
+        max_line_w = max((draw.textbbox((0, 0), ln, font=self.font)[2] for ln in lines), default=1)
+        x_pad = 10
+        bg_x1 = (w - max_line_w) // 2 - x_pad
+        bg_x2 = (w + max_line_w) // 2 + x_pad
+        draw.rectangle([(bg_x1, y_start - 4), (bg_x2, y_start + total_h)], fill=self.bg_color)
+
+        for i, line in enumerate(lines):
+            tb = draw.textbbox((0, 0), line, font=self.font)
+            lw = tb[2] - tb[0]
+            lx = (w - lw) // 2
+            ly = y_start + i * line_h
+            draw.text((lx, ly), line, font=self.font, fill=self.text_color)
+
         composed = Image.alpha_composite(base, overlay)
         return cv2.cvtColor(np.array(composed), cv2.COLOR_RGBA2BGR)
 
 
-def annotate_video_from_cache(input_video_path, output_video_path, annotator):
+class EmotionAnalyzer:
+    EMOTION_COLORS = {
+        "happy": (0, 255, 100, 220),
+        "sad": (100, 100, 255, 220),
+        "angry": (255, 60, 60, 220),
+        "fear": (200, 100, 255, 220),
+        "surprise": (0, 230, 230, 220),
+        "disgust": (60, 200, 100, 220),
+        "neutral": (200, 200, 200, 220),
+    }
+    DEFAULT_COLOR = (255, 255, 255, 220)
+
+    def __init__(self, enabled, hz=2.0):
+        self.enabled = enabled
+        self.hz = hz
+        self.cached_by_frame = []
+        self.font = YoloAnnotator._load_font(size=14)
+
+    def _analyze_frame(self, frame):
+        try:
+            from deepface import DeepFace
+
+            results = DeepFace.analyze(
+                frame,
+                actions=["emotion"],
+                enforce_detection=False,
+                silent=True,
+            )
+            if not isinstance(results, list):
+                results = [results]
+            faces = []
+            for r in results:
+                region = r.get("region", {})
+                x = region.get("x", 0)
+                y = region.get("y", 0)
+                rw = region.get("w", 0)
+                rh = region.get("h", 0)
+                if rw <= 0 or rh <= 0:
+                    continue
+                emotion = r.get("dominant_emotion", "neutral")
+                conf = r.get("emotion", {}).get(emotion, 0.0)
+                faces.append({"box": [x, y, x + rw, y + rh], "emotion": emotion, "conf": float(conf)})
+            return faces
+        except Exception:
+            return []
+
+    def build_cache(self, input_video_path):
+        if not self.enabled:
+            return
+
+        cap = cv2.VideoCapture(input_video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video for emotion analysis: {input_video_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        frame_interval = max(1, int(round(fps / self.hz)))
+
+        print(f"Running emotion analysis at {self.hz}Hz (every {frame_interval} frame(s))...")
+        self.cached_by_frame = []
+        last_result = []
+        frame_index = 0
+        last_progress = -1
+
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            if frame_index % frame_interval == 0:
+                last_result = self._analyze_frame(frame)
+            self.cached_by_frame.append(last_result)
+            frame_index += 1
+            last_progress = update_progress("Emotion", frame_index, total_frames, last_progress)
+
+        cap.release()
+        print(f"Emotion analysis cache ready: {frame_index} frame(s) processed")
+
+    def draw_from_cache(self, frame, frame_index):
+        if not self.enabled or frame_index >= len(self.cached_by_frame):
+            return frame
+
+        faces = self.cached_by_frame[frame_index]
+        if not faces:
+            return frame
+
+        h, w = frame.shape[:2]
+        base = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGBA))
+        overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+
+        for face in faces:
+            x1, y1, x2, y2 = [int(v) for v in face["box"]]
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(0, min(w - 1, x2))
+            y2 = max(0, min(h - 1, y2))
+
+            emotion = face["emotion"]
+            conf = face["conf"]
+            label = f"{emotion} {int(conf)}%"
+            color = self.EMOTION_COLORS.get(emotion, self.DEFAULT_COLOR)
+
+            draw.rectangle([(x1, y1), (x2, y2)], outline=color, width=2)
+            tb = draw.textbbox((0, 0), label, font=self.font)
+            tw = tb[2] - tb[0]
+            th = tb[3] - tb[1]
+            tx = max(0, min(w - tw - 1, x1))
+            ty = max(0, y1 - th - 4)
+            draw.rectangle([(tx - 1, ty - 1), (tx + tw + 1, ty + th + 1)], fill=(0, 0, 0, 160))
+            draw.text((tx, ty), label, font=self.font, fill=color)
+
+        composed = Image.alpha_composite(base, overlay)
+        return cv2.cvtColor(np.array(composed), cv2.COLOR_RGBA2BGR)
+
+
+def annotate_video_from_cache(input_video_path, output_video_path, annotator, captioner=None, emotion_analyzer=None):
     cap = cv2.VideoCapture(input_video_path)
     if not cap.isOpened():
         raise RuntimeError(f"Failed to open video for annotation: {input_video_path}")
@@ -363,6 +626,10 @@ def annotate_video_from_cache(input_video_path, output_video_path, annotator):
         if not ok:
             break
         annotated = annotator.draw_from_cache(frame, frame_index)
+        if emotion_analyzer is not None:
+            annotated = emotion_analyzer.draw_from_cache(annotated, frame_index)
+        if captioner is not None:
+            annotated = captioner.draw_caption(annotated, frame_index, fps)
         writer.write(annotated)
         frame_index += 1
         last_progress = update_progress("Annotate", frame_index, total_frames, last_progress)
@@ -409,7 +676,7 @@ def main():
     os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
-    total_stages = 5
+    total_stages = 7
     log_stage(1, total_stages, "Reading input metadata")
     input_framerate = get_input_framerate(input_file)
     print(f"Input framerate: {input_framerate} fps")
@@ -473,6 +740,20 @@ def main():
         annotator.build_cache(input_file)
     else:
         log_stage(5, total_stages, "Skipping YOLO cache (disabled)")
+
+    captioner = WhisperCaptioner(enabled=args.whisper, model_name=args.whisper_model)
+    if captioner.enabled:
+        log_stage(6, total_stages, "Building Whisper transcription cache")
+        captioner.build_cache(input_file)
+    else:
+        log_stage(6, total_stages, "Skipping Whisper (disabled)")
+
+    emotion_analyzer = EmotionAnalyzer(enabled=args.emotion, hz=args.emotion_hz)
+    if emotion_analyzer.enabled:
+        log_stage(7, total_stages, f"Building emotion analysis cache ({args.emotion_hz}Hz)")
+        emotion_analyzer.build_cache(input_file)
+    else:
+        log_stage(7, total_stages, "Skipping emotion analysis (disabled)")
 
     total_output_count = len(GLITCH_TYPES) * NUM_OUTPUTS
     completed_output_count = 0
@@ -555,11 +836,27 @@ def main():
                 quiet=True,
             )
 
-            if annotator.enabled:
-                print(f"Applying cached YOLO overlay ({annotator.mode}) to {output_file}...")
+            if annotator.enabled or captioner.enabled or emotion_analyzer.enabled:
+                overlay_desc = ", ".join(
+                    filter(
+                        None,
+                        [
+                            f"YOLO ({annotator.mode})" if annotator.enabled else None,
+                            "Whisper captions" if captioner.enabled else None,
+                            f"emotion @ {emotion_analyzer.hz}Hz" if emotion_analyzer.enabled else None,
+                        ],
+                    )
+                )
+                print(f"Applying overlays [{overlay_desc}] to {output_file}...")
                 annotated_no_audio = os.path.join(TEMP_DIR, f"annotated_{uuid.uuid4().hex}.mp4")
                 try:
-                    annotate_video_from_cache(output_file, annotated_no_audio, annotator)
+                    annotate_video_from_cache(
+                        output_file,
+                        annotated_no_audio,
+                        annotator,
+                        captioner=captioner if captioner.enabled else None,
+                        emotion_analyzer=emotion_analyzer if emotion_analyzer.enabled else None,
+                    )
                     remux_audio(annotated_no_audio, output_file, output_file)
                 finally:
                     if os.path.exists(annotated_no_audio):
