@@ -51,6 +51,18 @@ Use a different YOLO model or confidence threshold:
 docker compose run --rm glitchsvc your_video.mp4 --yolo --yolo-model yolo11s-seg.pt --yolo-conf 0.35
 ```
 
+7. Optional emotion analysis overlay on detected faces:
+
+```bash
+docker compose run --rm glitchsvc your_video.mp4 --emotion
+```
+
+8. Adjust emotion analysis frequency (default is 2 Hz):
+
+```bash
+docker compose run --rm glitchsvc your_video.mp4 --emotion --emotion-hz 1.0
+```
+
 ## Clean up containers
 
 ```bash
@@ -65,3 +77,5 @@ docker compose down
 - YOLO uses GPU automatically when available and falls back to CPU otherwise.
 - YOLO analysis is performed once on the input video, then reused for every generated output.
 - `--yolo-mode` defaults to `segmentation`; use `--yolo-mode box` for rectangle-only overlays.
+- Emotion analysis is performed once on the input video and reused for every generated output.
+- `--emotion-hz` defaults to `2.0`; lower values process fewer frames per second and run faster.
