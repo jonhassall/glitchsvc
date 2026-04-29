@@ -6,6 +6,10 @@ import uuid
 
 import cv2
 import numpy as np
+
+# Reduce noisy non-fatal backend warnings (for example unsupported NNPACK).
+os.environ.setdefault("TORCH_CPP_LOG_LEVEL", "ERROR")
+
 import torch
 from PIL import Image, ImageDraw, ImageFont
 from ultralytics import YOLO
