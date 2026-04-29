@@ -1,0 +1,10 @@
+services:
+  glitchsvc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /work
+    volumes:
+      - ./:/work
+    entrypoint: ["python", "glitch_svc.py"]
+    command: ["input.mp4"]

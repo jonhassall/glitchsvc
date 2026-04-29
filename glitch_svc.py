@@ -1,11 +1,11 @@
 import os
 import subprocess
 import random
+import argparse
 import numpy as np
 
 # === CONFIG ===
-INPUT_FILE = "input.mp4"
-OUTPUT_DIR = "glitched_outputs"
+OUTPUT_ROOT_DIR = "glitched_outputs"
 TEMP_DIR = "tmp_svc"
 BASE_LAYER_FILE = os.path.join(TEMP_DIR, "base_layer.264")
 ENH_LAYER_FILE = os.path.join(TEMP_DIR, "enh_layer.264")
@@ -24,6 +24,20 @@ GLITCH_TYPES = {
     "keyframe": "Obliterate keyframes (I-frames)",
     "keyframe_destroy": "Completely destroy keyframes (total annihilation)"
 }
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate glitched video variants from an input file")
+    parser.add_argument("input_file", help="Path to the input video file")
+    return parser.parse_args()
+
+args = parse_args()
+INPUT_FILE = args.input_file
+
+if not os.path.isfile(INPUT_FILE):
+    raise FileNotFoundError(f"Input file not found: {INPUT_FILE}")
+
+input_basename = os.path.splitext(os.path.basename(INPUT_FILE))[0]
+OUTPUT_DIR = os.path.join(OUTPUT_ROOT_DIR, input_basename)
 
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
