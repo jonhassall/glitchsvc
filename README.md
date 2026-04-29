@@ -63,6 +63,14 @@ docker compose run --rm glitchsvc your_video.mp4 --emotion
 docker compose run --rm glitchsvc your_video.mp4 --emotion --emotion-hz 1.0
 ```
 
+## Everything on
+
+Run with all overlays and analysis enabled at once:
+
+```bash
+docker compose run --rm glitchsvc your_video.mp4 --yolo --yolo-mode segmentation --yolo-model yolo11n-seg.pt --yolo-conf 0.25 --whisper --whisper-model base --emotion --emotion-hz 2.0
+```
+
 ## Clean up containers
 
 ```bash
