@@ -107,14 +107,25 @@ def get_input_framerate(input_file):
 
 
 def find_nal_indices(h264_bytes):
+    """Return (offset, start_code_len) for every NAL start code.
+
+    Uses bytes.find() to avoid creating a temporary slice object at every
+    byte position, which was the dominant source of GC pressure in large
+    files.
+    """
     indices = []
     i = 0
-    while i < len(h264_bytes) - 4:
-        if h264_bytes[i : i + 3] == b"\x00\x00\x01":
-            indices.append((i, 3))
-        elif h264_bytes[i : i + 4] == b"\x00\x00\x00\x01":
-            indices.append((i, 4))
-        i += 1
+    n = len(h264_bytes)
+    while i < n - 3:
+        j = h264_bytes.find(b"\x00\x00\x01", i)
+        if j == -1:
+            break
+        # A leading zero makes this a 4-byte start code (\x00\x00\x00\x01).
+        if j >= 1 and h264_bytes[j - 1] == 0:
+            indices.append((j - 1, 4))
+        else:
+            indices.append((j, 3))
+        i = j + 3
     return indices
 
 
@@ -723,11 +734,11 @@ def main():
         quiet=True,
     )
 
-    with open(ENH_LAYER_FILE, "rb") as f:
-        original_data = bytearray(f.read())
-
     log_stage(4, total_stages, "Finding NAL units")
-    indices = find_nal_indices(original_data)
+    with open(ENH_LAYER_FILE, "rb") as f:
+        _enh_bytes = f.read()
+    indices = find_nal_indices(_enh_bytes)
+    del _enh_bytes  # free the large buffer; each iteration re-reads from disk
 
     annotator = YoloAnnotator(
         enabled=args.yolo,
@@ -772,7 +783,8 @@ def main():
                 f"({current_output}/{total_output_count}) ==="
             )
 
-            data = bytearray(original_data)
+            with open(ENH_LAYER_FILE, "rb") as f:
+                data = bytearray(f.read())
             corrupted_count = 0
             last_nal_progress = -1
             total_nals = len(indices)
