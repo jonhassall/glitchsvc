@@ -130,51 +130,42 @@ def find_nal_indices(h264_bytes):
 
 
 def corrupt_nal(data, nal_data_start, nal_end, glitch_type):
+    region_start = nal_data_start + 10
+
     if glitch_type == "random":
-        corrupt_pos = random.randint(nal_data_start + 10, nal_end - 1)
-        data[corrupt_pos] = random.randint(0, 255)
+        data[random.randint(region_start, nal_end - 1)] = random.randint(0, 255)
 
     elif glitch_type == "zero":
-        corrupt_pos = random.randint(nal_data_start + 10, nal_end - 1)
-        data[corrupt_pos] = 0
+        data[random.randint(region_start, nal_end - 1)] = 0
 
     elif glitch_type == "block":
         block_size = random.randint(5, 20)
-        start_pos = random.randint(nal_data_start + 10, max(nal_data_start + 11, nal_end - block_size))
-        for offset in range(block_size):
-            if start_pos + offset < nal_end:
-                data[start_pos + offset] = random.randint(0, 255)
+        start_pos = random.randint(region_start, max(region_start + 1, nal_end - block_size))
+        end_pos = min(start_pos + block_size, nal_end)
+        data[start_pos:end_pos] = np.random.randint(0, 256, size=end_pos - start_pos, dtype=np.uint8)
 
     elif glitch_type == "constant":
-        nal_length = nal_end - nal_data_start - 10
-        num_corruptions = max(5, nal_length // 20)
-        for _ in range(num_corruptions):
-            corrupt_pos = random.randint(nal_data_start + 10, nal_end - 1)
-            data[corrupt_pos] = random.randint(0, 255)
+        region_len = nal_end - region_start
+        num_corruptions = max(5, region_len // 20)
+        positions = np.random.randint(region_start, nal_end, size=num_corruptions)
+        data[positions] = np.random.randint(0, 256, size=num_corruptions, dtype=np.uint8)
 
     elif glitch_type == "interval":
         interval = random.randint(15, 40)
-        pos = nal_data_start + 10
-        while pos < nal_end - 1:
-            data[pos] = random.randint(0, 255)
-            pos += interval
+        positions = np.arange(region_start, nal_end - 1, interval)
+        data[positions] = np.random.randint(0, 256, size=len(positions), dtype=np.uint8)
 
     elif glitch_type == "keyframe":
-        nal_length = nal_end - nal_data_start - 10
-        num_corruptions = max(20, nal_length // 5)
-        for _ in range(num_corruptions):
-            corrupt_pos = random.randint(nal_data_start + 10, nal_end - 1)
-            data[corrupt_pos] = random.randint(0, 255)
+        region_len = nal_end - region_start
+        num_corruptions = max(20, region_len // 5)
+        positions = np.random.randint(region_start, nal_end, size=num_corruptions)
+        data[positions] = np.random.randint(0, 256, size=num_corruptions, dtype=np.uint8)
 
     elif glitch_type == "keyframe_destroy":
-        nal_length = nal_end - nal_data_start - 10
-        num_corruptions = max(50, int(nal_length * 0.7))
-        corrupted_positions = set()
-        for _ in range(num_corruptions):
-            corrupt_pos = random.randint(nal_data_start + 10, nal_end - 1)
-            if corrupt_pos not in corrupted_positions:
-                data[corrupt_pos] = random.randint(0, 255)
-                corrupted_positions.add(corrupt_pos)
+        region_len = nal_end - region_start
+        num_corruptions = max(50, int(region_len * 0.7))
+        positions = np.random.randint(region_start, nal_end, size=num_corruptions)
+        data[positions] = np.random.randint(0, 256, size=num_corruptions, dtype=np.uint8)
 
 
 class YoloAnnotator:
@@ -736,9 +727,9 @@ def main():
 
     log_stage(4, total_stages, "Finding NAL units")
     with open(ENH_LAYER_FILE, "rb") as f:
-        _enh_bytes = f.read()
-    indices = find_nal_indices(_enh_bytes)
-    del _enh_bytes  # free the large buffer; each iteration re-reads from disk
+        original_bytes = f.read()
+    indices = find_nal_indices(original_bytes)
+    # original_bytes kept in RAM to avoid reading the same file 98 times
 
     annotator = YoloAnnotator(
         enabled=args.yolo,
@@ -783,8 +774,9 @@ def main():
                 f"({current_output}/{total_output_count}) ==="
             )
 
-            with open(ENH_LAYER_FILE, "rb") as f:
-                data = bytearray(f.read())
+            # np.frombuffer gives a read-only view; .copy() makes a writable
+            # C-level copy — avoids re-reading from disk every iteration.
+            data = np.frombuffer(original_bytes, dtype=np.uint8).copy()
             corrupted_count = 0
             last_nal_progress = -1
             total_nals = len(indices)
@@ -811,7 +803,7 @@ def main():
             print(f"Corrupted {corrupted_count} NAL units")
 
             with open(GLITCHED_FILE, "wb") as f:
-                f.write(data)
+                f.write(data.tobytes())
 
             output_file = os.path.join(
                 output_dir,
