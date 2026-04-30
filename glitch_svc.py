@@ -1,9 +1,10 @@
 import argparse
 import os
-import random
 import subprocess
+import threading
 import uuid
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import numpy as np
@@ -81,6 +82,12 @@ def parse_args():
     parser.add_argument("--whisper-model", default="base", help="Whisper model name (tiny/base/small/medium/large)")
     parser.add_argument("--emotion", action="store_true", help="Enable emotion analysis overlay on detected faces")
     parser.add_argument("--emotion-hz", type=float, default=2.0, help="Emotion analysis frequency in Hz (default: 2)")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=min(4, (os.cpu_count() or 4)),
+        help="Parallel ffmpeg workers (default: min(4, cpu_count))",
+    )
     return parser.parse_args()
 
 
@@ -129,43 +136,138 @@ def find_nal_indices(h264_bytes):
     return indices
 
 
-def corrupt_nal(data, nal_data_start, nal_end, glitch_type):
+# Thread-safe print using a module-level lock.
+_print_lock = threading.Lock()
+
+
+def _tprint(*args, **kwargs):
+    with _print_lock:
+        print(*args, **kwargs)
+
+
+def corrupt_nal(data, nal_data_start, nal_end, glitch_type, rng):
+    """Corrupt bytes inside one NAL unit. `rng` is a per-thread numpy Generator."""
     region_start = nal_data_start + 10
 
     if glitch_type == "random":
-        data[random.randint(region_start, nal_end - 1)] = random.randint(0, 255)
+        data[rng.integers(region_start, nal_end)] = rng.integers(0, 256)
 
     elif glitch_type == "zero":
-        data[random.randint(region_start, nal_end - 1)] = 0
+        data[rng.integers(region_start, nal_end)] = 0
 
     elif glitch_type == "block":
-        block_size = random.randint(5, 20)
-        start_pos = random.randint(region_start, max(region_start + 1, nal_end - block_size))
+        block_size = int(rng.integers(5, 21))
+        start_pos = int(rng.integers(region_start, max(region_start + 1, nal_end - block_size)))
         end_pos = min(start_pos + block_size, nal_end)
-        data[start_pos:end_pos] = np.random.randint(0, 256, size=end_pos - start_pos, dtype=np.uint8)
+        data[start_pos:end_pos] = rng.integers(0, 256, size=end_pos - start_pos, dtype=np.uint8)
 
     elif glitch_type == "constant":
         region_len = nal_end - region_start
         num_corruptions = max(5, region_len // 20)
-        positions = np.random.randint(region_start, nal_end, size=num_corruptions)
-        data[positions] = np.random.randint(0, 256, size=num_corruptions, dtype=np.uint8)
+        positions = rng.integers(region_start, nal_end, size=num_corruptions)
+        data[positions] = rng.integers(0, 256, size=num_corruptions, dtype=np.uint8)
 
     elif glitch_type == "interval":
-        interval = random.randint(15, 40)
+        interval = int(rng.integers(15, 41))
         positions = np.arange(region_start, nal_end - 1, interval)
-        data[positions] = np.random.randint(0, 256, size=len(positions), dtype=np.uint8)
+        data[positions] = rng.integers(0, 256, size=len(positions), dtype=np.uint8)
 
     elif glitch_type == "keyframe":
         region_len = nal_end - region_start
         num_corruptions = max(20, region_len // 5)
-        positions = np.random.randint(region_start, nal_end, size=num_corruptions)
-        data[positions] = np.random.randint(0, 256, size=num_corruptions, dtype=np.uint8)
+        positions = rng.integers(region_start, nal_end, size=num_corruptions)
+        data[positions] = rng.integers(0, 256, size=num_corruptions, dtype=np.uint8)
 
     elif glitch_type == "keyframe_destroy":
         region_len = nal_end - region_start
         num_corruptions = max(50, int(region_len * 0.7))
-        positions = np.random.randint(region_start, nal_end, size=num_corruptions)
-        data[positions] = np.random.randint(0, 256, size=num_corruptions, dtype=np.uint8)
+        positions = rng.integers(region_start, nal_end, size=num_corruptions)
+        data[positions] = rng.integers(0, 256, size=num_corruptions, dtype=np.uint8)
+
+
+def _process_one_output(
+    glitch_type,
+    glitch_prob,
+    video_num,
+    original_bytes,
+    indices,
+    output_file,
+    input_file,
+    input_framerate,
+    annotator,
+    captioner,
+    emotion_analyzer,
+    total_output_count,
+    completed_counter,
+    counter_lock,
+):
+    """Worker: corrupt bytes, pipe directly to ffmpeg, optionally annotate."""
+    rng = np.random.default_rng()  # independent per-thread seed
+
+    # --- Apply corruption ---
+    data = np.frombuffer(original_bytes, dtype=np.uint8).copy()
+    data_len = len(data)
+    n_indices = len(indices)
+    keyframe_only = glitch_type in ("keyframe", "keyframe_destroy")
+    corrupted_count = 0
+
+    for i, (idx, start_code_len) in enumerate(indices):
+        nal_byte_pos = idx + start_code_len
+        if nal_byte_pos < data_len:
+            nal_type = int(data[nal_byte_pos]) & 0x1F
+            if keyframe_only:
+                should_corrupt = nal_type == 5 and rng.random() < glitch_prob
+            else:
+                should_corrupt = nal_type in (1, 5) and rng.random() < glitch_prob
+            if should_corrupt:
+                nal_end = indices[i + 1][0] if i + 1 < n_indices else data_len
+                nal_data_start = nal_byte_pos + 1
+                if nal_data_start + 10 < nal_end:
+                    corrupt_nal(data, nal_data_start, nal_end, glitch_type, rng)
+                    corrupted_count += 1
+
+    # --- Pipe corrupted H.264 directly to ffmpeg (no temp file) ---
+    proc = subprocess.Popen(
+        [
+            "ffmpeg", "-y",
+            "-f", "h264", "-r", input_framerate, "-i", "pipe:0",
+            "-i", input_file,
+            "-map", "0:v:0", "-map", "1:a?",
+            "-c:v", "copy", "-c:a", "copy",
+            "-r", input_framerate, "-vsync", "cfr", "-fflags", "+genpts",
+            output_file,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    proc.communicate(data)  # numpy array satisfies the buffer protocol — no copy
+    del data
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg exited {proc.returncode} for {output_file}")
+
+    # --- Optional overlays ---
+    if annotator.enabled or captioner.enabled or emotion_analyzer.enabled:
+        annotated_no_audio = os.path.join(TEMP_DIR, f"annotated_{uuid.uuid4().hex}.mp4")
+        try:
+            annotate_video_from_cache(
+                output_file,
+                annotated_no_audio,
+                annotator,
+                captioner=captioner if captioner.enabled else None,
+                emotion_analyzer=emotion_analyzer if emotion_analyzer.enabled else None,
+            )
+            remux_audio(annotated_no_audio, output_file, output_file)
+        finally:
+            if os.path.exists(annotated_no_audio):
+                os.remove(annotated_no_audio)
+
+    with counter_lock:
+        completed_counter[0] += 1
+        done = completed_counter[0]
+    done_pct = int((done / total_output_count) * 100)
+    _tprint(f"[{done_pct:3d}% | {done}/{total_output_count}] {os.path.basename(output_file)} "
+            f"({corrupted_count} NALs corrupted)")
 
 
 class YoloAnnotator:
@@ -758,117 +860,52 @@ def main():
         log_stage(7, total_stages, "Skipping emotion analysis (disabled)")
 
     total_output_count = len(GLITCH_TYPES) * NUM_OUTPUTS
-    completed_output_count = 0
+    print(f"\nGenerating {total_output_count} outputs with {args.workers} parallel worker(s)...")
 
-    for glitch_type_index, (glitch_type, glitch_desc) in enumerate(GLITCH_TYPES.items(), 1):
-        print(f"\n{'=' * 60}")
-        print(f"GLITCH TYPE: {glitch_desc} ({glitch_type_index}/{len(GLITCH_TYPES)})")
-        print(f"{'=' * 60}")
-
-        for video_num, glitch_prob in enumerate(GLITCH_LEVELS, 1):
-            current_output = completed_output_count + 1
-            overall_pct = int((current_output / total_output_count) * 100)
-            print(
-                f"\n=== Generating {glitch_type} video {video_num}/{NUM_OUTPUTS} "
-                f"(corruption: {glitch_prob * 100:.0f}%) | overall {overall_pct}% "
-                f"({current_output}/{total_output_count}) ==="
-            )
-
-            # np.frombuffer gives a read-only view; .copy() makes a writable
-            # C-level copy — avoids re-reading from disk every iteration.
-            data = np.frombuffer(original_bytes, dtype=np.uint8).copy()
-            corrupted_count = 0
-            last_nal_progress = -1
-            total_nals = len(indices)
-
-            for i, (idx, start_code_len) in enumerate(indices):
-                nal_byte_pos = idx + start_code_len
-                if nal_byte_pos < len(data):
-                    nal_type = data[nal_byte_pos] & 0x1F
-
-                    if glitch_type in ["keyframe", "keyframe_destroy"]:
-                        should_corrupt = nal_type == 5 and random.random() < glitch_prob
-                    else:
-                        should_corrupt = nal_type in [1, 5] and random.random() < glitch_prob
-
-                    if should_corrupt:
-                        nal_end = indices[i + 1][0] if i + 1 < len(indices) else len(data)
-                        nal_data_start = nal_byte_pos + 1
-                        if nal_data_start + 10 < nal_end:
-                            corrupt_nal(data, nal_data_start, nal_end, glitch_type)
-                            corrupted_count += 1
-
-                last_nal_progress = update_progress("NAL scan", i + 1, total_nals, last_nal_progress)
-
-            print(f"Corrupted {corrupted_count} NAL units")
-
-            with open(GLITCHED_FILE, "wb") as f:
-                f.write(data.tobytes())
-
-            output_file = os.path.join(
+    tasks = [
+        (
+            glitch_type,
+            glitch_prob,
+            video_num,
+            os.path.join(
                 output_dir,
                 f"glitched_{glitch_type}_{video_num:02d}_{int(glitch_prob * 100):02d}pct.mp4",
-            )
-            print(f"Remuxing to {output_file}...")
+            ),
+        )
+        for glitch_type in GLITCH_TYPES
+        for video_num, glitch_prob in enumerate(GLITCH_LEVELS, 1)
+    ]
 
-            run_cmd(
-                [
-                    "ffmpeg",
-                    "-y",
-                    "-r",
-                    input_framerate,
-                    "-i",
-                    GLITCHED_FILE,
-                    "-i",
-                    input_file,
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "1:a?",
-                    "-c:v",
-                    "copy",
-                    "-c:a",
-                    "copy",
-                    "-r",
-                    input_framerate,
-                    "-vsync",
-                    "cfr",
-                    "-fflags",
-                    "+genpts",
-                    output_file,
-                ],
-                quiet=True,
-            )
+    completed_counter = [0]  # mutable container so worker threads can increment it
+    counter_lock = threading.Lock()
 
-            if annotator.enabled or captioner.enabled or emotion_analyzer.enabled:
-                overlay_desc = ", ".join(
-                    filter(
-                        None,
-                        [
-                            f"YOLO ({annotator.mode})" if annotator.enabled else None,
-                            "Whisper captions" if captioner.enabled else None,
-                            f"emotion @ {emotion_analyzer.hz}Hz" if emotion_analyzer.enabled else None,
-                        ],
-                    )
-                )
-                print(f"Applying overlays [{overlay_desc}] to {output_file}...")
-                annotated_no_audio = os.path.join(TEMP_DIR, f"annotated_{uuid.uuid4().hex}.mp4")
-                try:
-                    annotate_video_from_cache(
-                        output_file,
-                        annotated_no_audio,
-                        annotator,
-                        captioner=captioner if captioner.enabled else None,
-                        emotion_analyzer=emotion_analyzer if emotion_analyzer.enabled else None,
-                    )
-                    remux_audio(annotated_no_audio, output_file, output_file)
-                finally:
-                    if os.path.exists(annotated_no_audio):
-                        os.remove(annotated_no_audio)
-
-            completed_output_count += 1
-            done_pct = int((completed_output_count / total_output_count) * 100)
-            print(f"[overall] {done_pct}% complete ({completed_output_count}/{total_output_count} outputs)")
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = {
+            executor.submit(
+                _process_one_output,
+                glitch_type,
+                glitch_prob,
+                video_num,
+                original_bytes,
+                indices,
+                output_file,
+                input_file,
+                input_framerate,
+                annotator,
+                captioner,
+                emotion_analyzer,
+                total_output_count,
+                completed_counter,
+                counter_lock,
+            ): output_file
+            for glitch_type, glitch_prob, video_num, output_file in tasks
+        }
+        for future in as_completed(futures):
+            output_file = futures[future]
+            try:
+                future.result()
+            except Exception as exc:
+                _tprint(f"ERROR: {os.path.basename(output_file)}: {exc}")
 
     print(f"\n{'=' * 60}")
     print(
