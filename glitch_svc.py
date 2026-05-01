@@ -19,9 +19,7 @@ from ultralytics import YOLO
 # === CONFIG ===
 OUTPUT_ROOT_DIR = "glitched_outputs"
 TEMP_DIR = "tmp_svc"
-BASE_LAYER_FILE = os.path.join(TEMP_DIR, "base_layer.264")
 ENH_LAYER_FILE = os.path.join(TEMP_DIR, "enh_layer.264")
-GLITCHED_FILE = os.path.join(TEMP_DIR, "glitched.264")
 
 NUM_OUTPUTS = 14
 GLITCH_LEVELS = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50, 0.65, 0.80, 0.90, 0.95, 0.98, 0.99]
@@ -85,8 +83,8 @@ def parse_args():
     parser.add_argument(
         "--workers",
         type=int,
-        default=min(4, (os.cpu_count() or 4)),
-        help="Parallel ffmpeg workers (default: min(4, cpu_count))",
+        default=(os.cpu_count() or 4),
+        help="Parallel ffmpeg workers (default: cpu_count)",
     )
     return parser.parse_args()
 
@@ -111,6 +109,20 @@ def get_input_framerate(input_file):
     if not framerate:
         raise RuntimeError("Could not read input framerate from ffprobe output")
     return framerate
+
+
+def get_input_video_codec(input_file):
+    result = run_cmd(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            input_file,
+        ],
+        capture_output=True,
+    )
+    return result.stdout.strip().lower()
 
 
 def find_nal_indices(h264_bytes):
@@ -190,7 +202,10 @@ def _process_one_output(
     glitch_prob,
     video_num,
     original_bytes,
-    indices,
+    nal_ends_slice,
+    nal_data_starts_slice,
+    nal_ends_iframe,
+    nal_data_starts_iframe,
     output_file,
     input_file,
     input_framerate,
@@ -204,27 +219,24 @@ def _process_one_output(
     """Worker: corrupt bytes, pipe directly to ffmpeg, optionally annotate."""
     rng = np.random.default_rng()  # independent per-thread seed
 
-    # --- Apply corruption ---
+    # --- Apply corruption (fully vectorized NAL selection) ---
     data = np.frombuffer(original_bytes, dtype=np.uint8).copy()
-    data_len = len(data)
-    n_indices = len(indices)
-    keyframe_only = glitch_type in ("keyframe", "keyframe_destroy")
-    corrupted_count = 0
 
-    for i, (idx, start_code_len) in enumerate(indices):
-        nal_byte_pos = idx + start_code_len
-        if nal_byte_pos < data_len:
-            nal_type = int(data[nal_byte_pos]) & 0x1F
-            if keyframe_only:
-                should_corrupt = nal_type == 5 and rng.random() < glitch_prob
-            else:
-                should_corrupt = nal_type in (1, 5) and rng.random() < glitch_prob
-            if should_corrupt:
-                nal_end = indices[i + 1][0] if i + 1 < n_indices else data_len
-                nal_data_start = nal_byte_pos + 1
-                if nal_data_start + 10 < nal_end:
-                    corrupt_nal(data, nal_data_start, nal_end, glitch_type, rng)
-                    corrupted_count += 1
+    if glitch_type in ("keyframe", "keyframe_destroy"):
+        eligible_ends = nal_ends_iframe
+        eligible_data_starts = nal_data_starts_iframe
+    else:
+        eligible_ends = nal_ends_slice
+        eligible_data_starts = nal_data_starts_slice
+
+    n_eligible = len(eligible_ends)
+    if n_eligible:
+        to_corrupt = np.where(rng.random(n_eligible) < glitch_prob)[0]
+        for j in to_corrupt:
+            corrupt_nal(data, int(eligible_data_starts[j]), int(eligible_ends[j]), glitch_type, rng)
+        corrupted_count = len(to_corrupt)
+    else:
+        corrupted_count = 0
 
     # --- Pipe corrupted H.264 directly to ffmpeg (no temp file) ---
     proc = subprocess.Popen(
@@ -780,58 +792,63 @@ def main():
     os.makedirs(TEMP_DIR, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
-    total_stages = 7
+    total_stages = 6
     log_stage(1, total_stages, "Reading input metadata")
     input_framerate = get_input_framerate(input_file)
-    print(f"Input framerate: {input_framerate} fps")
+    input_codec = get_input_video_codec(input_file)
+    print(f"Input: {input_framerate} fps, codec={input_codec}")
 
-    log_stage(2, total_stages, "Encoding base layer")
-    run_cmd(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            input_file,
-            "-vf",
-            "scale=iw/4:ih/4",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "slow",
-            "-crf",
-            "28",
-            "-f",
-            "h264",
-            BASE_LAYER_FILE,
-        ],
-        quiet=True,
-    )
+    log_stage(2, total_stages, "Extracting enhancement layer")
+    if input_codec == "h264":
+        print("  Input is already H.264 — stream-copying (no re-encode)...")
+        run_cmd(
+            ["ffmpeg", "-y", "-i", input_file, "-c:v", "copy", "-an", "-f", "h264", ENH_LAYER_FILE],
+            quiet=True,
+        )
+    else:
+        print(f"  Input is {input_codec!r} — re-encoding with ultrafast preset...")
+        run_cmd(
+            [
+                "ffmpeg", "-y", "-i", input_file,
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                "-an", "-f", "h264", ENH_LAYER_FILE,
+            ],
+            quiet=True,
+        )
 
-    log_stage(3, total_stages, "Encoding enhancement layer")
-    run_cmd(
-        [
-            "ffmpeg",
-            "-y",
-            "-i",
-            input_file,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "slow",
-            "-crf",
-            "24",
-            "-f",
-            "h264",
-            ENH_LAYER_FILE,
-        ],
-        quiet=True,
-    )
-
-    log_stage(4, total_stages, "Finding NAL units")
+    log_stage(3, total_stages, "Indexing NAL units")
     with open(ENH_LAYER_FILE, "rb") as f:
         original_bytes = f.read()
     indices = find_nal_indices(original_bytes)
-    # original_bytes kept in RAM to avoid reading the same file 98 times
+
+    # Pre-compute per-NAL arrays once; workers use these instead of a Python for-loop.
+    _orig_arr = np.frombuffer(original_bytes, dtype=np.uint8)
+    _data_len = len(original_bytes)
+    _n = len(indices)
+    _starts = np.fromiter((idx for idx, _ in indices), dtype=np.int64, count=_n)
+    _sc_lens = np.fromiter((sc for _, sc in indices), dtype=np.int64, count=_n)
+    _nal_pos = _starts + _sc_lens            # position of each NAL header byte
+    _nal_ends = np.empty(_n, dtype=np.int64)
+    if _n > 1:
+        _nal_ends[:-1] = _starts[1:]
+    if _n > 0:
+        _nal_ends[-1] = _data_len
+    _nal_ds = _nal_pos + 1                   # nal_data_start for each NAL
+    _valid = _nal_pos < _data_len
+    _p = _nal_pos[_valid]
+    _e = _nal_ends[_valid]
+    _d = _nal_ds[_valid]
+    _types = (_orig_arr[_p] & 0x1F).astype(np.uint8)
+    _ok = (_e - (_d + 10)) > 0              # has enough bytes to corrupt
+    # Slice NALs (types 1 + 5)
+    _sm = ((_types == 1) | (_types == 5)) & _ok
+    nal_ends_slice = _e[_sm]
+    nal_data_starts_slice = _d[_sm]
+    # I-frame NALs (type 5 only)
+    _im = (_types == 5) & _ok
+    nal_ends_iframe = _e[_im]
+    nal_data_starts_iframe = _d[_im]
+    print(f"  {_n} NAL units indexed ({int(_sm.sum())} slice, {int(_im.sum())} I-frame)")
 
     annotator = YoloAnnotator(
         enabled=args.yolo,
@@ -840,24 +857,24 @@ def main():
         conf=args.yolo_conf,
     )
     if annotator.enabled:
-        log_stage(5, total_stages, "Building one-time YOLO cache")
+        log_stage(4, total_stages, "Building one-time YOLO cache")
         annotator.build_cache(input_file)
     else:
-        log_stage(5, total_stages, "Skipping YOLO cache (disabled)")
+        log_stage(4, total_stages, "Skipping YOLO cache (disabled)")
 
     captioner = WhisperCaptioner(enabled=args.whisper, model_name=args.whisper_model)
     if captioner.enabled:
-        log_stage(6, total_stages, "Building Whisper transcription cache")
+        log_stage(5, total_stages, "Building Whisper transcription cache")
         captioner.build_cache(input_file)
     else:
-        log_stage(6, total_stages, "Skipping Whisper (disabled)")
+        log_stage(5, total_stages, "Skipping Whisper (disabled)")
 
     emotion_analyzer = EmotionAnalyzer(enabled=args.emotion, hz=args.emotion_hz)
     if emotion_analyzer.enabled:
-        log_stage(7, total_stages, f"Building emotion analysis cache ({args.emotion_hz}Hz)")
+        log_stage(6, total_stages, f"Building emotion analysis cache ({args.emotion_hz}Hz)")
         emotion_analyzer.build_cache(input_file)
     else:
-        log_stage(7, total_stages, "Skipping emotion analysis (disabled)")
+        log_stage(6, total_stages, "Skipping emotion analysis (disabled)")
 
     total_output_count = len(GLITCH_TYPES) * NUM_OUTPUTS
     print(f"\nGenerating {total_output_count} outputs with {args.workers} parallel worker(s)...")
@@ -887,7 +904,10 @@ def main():
                 glitch_prob,
                 video_num,
                 original_bytes,
-                indices,
+                nal_ends_slice,
+                nal_data_starts_slice,
+                nal_ends_iframe,
+                nal_data_starts_iframe,
                 output_file,
                 input_file,
                 input_framerate,
